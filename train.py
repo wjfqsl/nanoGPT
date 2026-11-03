@@ -16,11 +16,14 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
+from __future__ import annotations
+
 import os
 import time
 import math
 import pickle
 from contextlib import nullcontext
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
@@ -78,8 +81,34 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
+def gpt_config_from_args(args: dict[str, Any]) -> GPTConfig:
+    # model_args is a loose dict (configurator / checkpoint); build a real GPTConfig for typing.
+    return GPTConfig(
+        n_layer=int(args['n_layer']),
+        n_head=int(args['n_head']),
+        n_embd=int(args['n_embd']),
+        block_size=int(args['block_size']),
+        bias=bool(args['bias']),
+        vocab_size=int(args['vocab_size']),
+        dropout=float(args['dropout']),
+    )
+
+
+def forward_loss(
+    engine: Any,
+    X: torch.Tensor,
+    Y: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # engine may be GPT / torch.compile / DDP; Module.__call__ is stubbed as Any.
+    logits_out, loss_out = engine(X, Y)
+    if not isinstance(logits_out, torch.Tensor) or not isinstance(loss_out, torch.Tensor):
+        raise TypeError(f"expected Tensor logits/loss, got {type(logits_out)}, {type(loss_out)}")
+    return logits_out, loss_out
+
+
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+ddp_local_rank = 0
 if ddp:
     init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
@@ -109,11 +138,12 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+# use torch.autocast (not torch.amp.autocast) so the symbol resolves for the type checker
+ctx = nullcontext() if device_type == 'cpu' else torch.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
+def get_batch(split: str) -> Tuple[torch.Tensor, torch.Tensor]:
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
@@ -136,7 +166,7 @@ best_val_loss = 1e9
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
+meta_vocab_size: Optional[int] = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
@@ -144,8 +174,10 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+model_args: dict[str, Any] = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+checkpoint: Optional[dict[str, Any]] = None
+raw_model: GPT
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -153,82 +185,85 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    gptconf = gpt_config_from_args(model_args)
+    raw_model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
+    loaded_ckpt: dict[str, Any] = torch.load(ckpt_path, map_location=device)
+    checkpoint = loaded_ckpt
+    checkpoint_model_args = loaded_ckpt['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
+    gptconf = gpt_config_from_args(model_args)
+    raw_model = GPT(gptconf)
+    raw_model.load_state_dict(loaded_ckpt['model'])
+    iter_num = loaded_ckpt['iter_num']
+    best_val_loss = loaded_ckpt['best_val_loss']
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
+    raw_model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
+        model_args[k] = getattr(raw_model.config, k)
+else:
+    raise ValueError(f"unknown init_from: {init_from!r}")
+
 # crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
+if block_size < raw_model.config.block_size:
+    raw_model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
-model.to(device)
+raw_model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = raw_model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
+    if checkpoint is None:
+        raise RuntimeError("resume requested but checkpoint was not loaded")
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
-# compile the model
+# Training engine may be GPT, torch.compile(...), and/or DDP.
+# Keep raw_model: GPT for attribute navigation (transformer/blocks/estimate_mfu/state_dict).
+# torch.compile's static type is roughly "(...) -> Any", which would poison `model` if reassigned.
+model: Any = raw_model
 if compile:
     print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    model = torch.compile(raw_model) # requires PyTorch 2.0
 
 # wrap model into DDP container
+ddp_model: Optional[DDP] = None
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    ddp_model = DDP(model, device_ids=[ddp_local_rank])
+    model = ddp_model
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss():
-    out = {}
+def estimate_loss() -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                _logits, loss = forward_loss(model, X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
 
 # learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
+def get_lr(it: int) -> float:
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
@@ -242,16 +277,18 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 # logging
+wandb: Any = None
 if wandb_log and master_process:
-    import wandb
+    import wandb as wandb_mod  # type: ignore[import-not-found]
+    wandb = wandb_mod
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+loss = torch.tensor(0.0)  # set every training iter; placeholder satisfies definite assignment
 while True:
 
     # determine and set the learning rate for this iteration
@@ -290,14 +327,14 @@ while True:
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        if ddp:
+        if ddp_model is not None:
             # in DDP training we only need to sync gradients at the last micro step.
             # the official way to do this is with model.no_sync() context manager, but
             # I really dislike that this bloats the code and forces us to repeat code
             # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            ddp_model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss = forward_loss(model, X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -306,7 +343,7 @@ while True:
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
