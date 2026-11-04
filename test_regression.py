@@ -21,6 +21,7 @@ from gpt2_weights import (
     detect_weight_format,
     iter_gpt2_named_param_specs,
     migrate_checkpoint,
+    normalize_native_state_dict,
     unwrap_compiled_state_dict,
 )
 from model import GPT, GPTConfig
@@ -183,8 +184,29 @@ class TestFormatDetectAndConvert(unittest.TestCase):
             n_embd=self.cfg.n_embd,
             weight_format=WeightFormat.NANOGPT_LEGACY,
         )
-        self.assertNotIn("transformer.blocks.0.attn.causal_mask", back)
+        self.assertNotIn("transformer.layers.0.attn.causal_mask", back)
         self.assertEqual(set(back), set(self.native))
+
+
+class TestNativeKeyNormalize(unittest.TestCase):
+    def test_blocks_renamed_to_layers(self):
+        sd = {
+            "transformer.tok_emb.weight": torch.zeros(2, 2),
+            "transformer.blocks.0.attn.qkv_proj.weight": torch.zeros(6, 2),
+            "transformer.blocks.1.mlp.up_proj.weight": torch.zeros(8, 2),
+        }
+        out = normalize_native_state_dict(sd)
+        self.assertIn("transformer.layers.0.attn.qkv_proj.weight", out)
+        self.assertIn("transformer.layers.1.mlp.up_proj.weight", out)
+        self.assertNotIn("transformer.blocks.0.attn.qkv_proj.weight", out)
+
+    def test_rejects_mixed_blocks_and_layers(self):
+        sd = {
+            "transformer.blocks.0.ln1.weight": torch.zeros(2),
+            "transformer.layers.0.ln1.weight": torch.zeros(2),
+        }
+        with self.assertRaises(ValueError):
+            normalize_native_state_dict(sd)
 
 
 class TestModelInvariants(unittest.TestCase):
@@ -314,10 +336,11 @@ class TestRealGpt2Checkpoint(unittest.TestCase):
             n_embd=self.model_args["n_embd"],
             weight_format=WeightFormat.NANOGPT_LEGACY,
         )
-        self.assertEqual(set(converted), set(self.native_ckpt["model"]))
+        native = normalize_native_state_dict(self.native_ckpt["model"])
+        self.assertEqual(set(converted), set(native))
         for k in converted:
             self.assertTrue(
-                torch.equal(converted[k], self.native_ckpt["model"][k]),
+                torch.equal(converted[k], native[k]),
                 f"mismatch after migrate: {k}",
             )
 
@@ -326,7 +349,7 @@ class TestRealGpt2Checkpoint(unittest.TestCase):
         x = torch.randint(0, self.cfg.vocab_size, (1, 16))
 
         model_native = GPT(self.cfg)
-        model_native.load_state_dict(self.native_ckpt["model"])
+        model_native.load_state_dict(normalize_native_state_dict(self.native_ckpt["model"]))
         model_native.eval()
 
         model_from_legacy = GPT(self.cfg)

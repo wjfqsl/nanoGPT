@@ -148,7 +148,8 @@ class MLP(nn.Module):
         return x
 
 
-class Block(nn.Module):
+class Layer(nn.Module):
+    """One transformer layer: Pre-LN attention + Pre-LN MLP, each with residual."""
 
     ln1: LayerNorm
     attn: CausalSelfAttention
@@ -169,12 +170,12 @@ class Block(nn.Module):
 
 
 class Transformer(nn.Module):
-    """Token/position embed + Block stack + final LayerNorm."""
+    """Token/position embed + Layer stack + final LayerNorm."""
 
     tok_emb: nn.Embedding
     pos_emb: nn.Embedding
     emb_dropout: nn.Dropout
-    blocks: nn.ModuleList
+    layers: nn.ModuleList
     ln_final: LayerNorm
 
     def __init__(self, config: GPTConfig):
@@ -182,14 +183,14 @@ class Transformer(nn.Module):
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.pos_emb = nn.Embedding(config.context_length, config.n_embd)
         self.emb_dropout = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.layers = nn.ModuleList([Layer(config) for _ in range(config.n_layer)])
         self.ln_final = LayerNorm(config.n_embd, bias=config.bias)
 
-    def iter_blocks(self) -> Iterator[Block]:
+    def iter_layers(self) -> Iterator[Layer]:
         # ModuleList.__iter__ is typed as Iterator[Module]; narrow for attribute navigation.
-        for module in self.blocks:
-            if not isinstance(module, Block):
-                raise TypeError(f"expected Block, got {type(module)}")
+        for module in self.layers:
+            if not isinstance(module, Layer):
+                raise TypeError(f"expected Layer, got {type(module)}")
             yield module
 
 
@@ -207,11 +208,11 @@ class GPT(nn.Module):
 
         # decoder-only GPT stack (data flow):
         #   idx --+--> tok_emb ----+
-        #         |                +--> (+) --> emb_dropout --> blocks[0..n) --> ln_final --> lm_head --> logits
+        #         |                +--> (+) --> emb_dropout --> layers[0..n) --> ln_final --> lm_head --> logits
         #   pos --+--> pos_emb ----+
         # tok_emb: token embedding  (vocab_size -> n_embd)
         # pos_emb: position embedding (context_length -> n_embd)
-        # blocks:  n_layer transformer Blocks (attn + mlp, residual)
+        # layers:  n_layer transformer Layers (attn + mlp, residual)
         # ln_final: final LayerNorm before the language-model head
         self.transformer = Transformer(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # (n_embd -> vocab_size)
@@ -261,8 +262,8 @@ class GPT(nn.Module):
         tok_emb: torch.Tensor = self.transformer.tok_emb(idx) # token embeddings of shape (B, T, n_embd)
         pos_emb: torch.Tensor = self.transformer.pos_emb(pos) # position embeddings of shape (T, n_embd)
         x: torch.Tensor = self.transformer.emb_dropout(tok_emb + pos_emb)
-        for block in self.transformer.iter_blocks():
-            x = block(x)
+        for layer in self.transformer.iter_layers():
+            x = layer(x)
         x = self.transformer.ln_final(x)
 
         if targets is not None:
@@ -283,9 +284,9 @@ class GPT(nn.Module):
         assert context_length <= self.config.context_length
         self.config.context_length = context_length
         self.transformer.pos_emb.weight = nn.Parameter(self.transformer.pos_emb.weight[:context_length])
-        for block in self.transformer.iter_blocks():
-            if hasattr(block.attn, 'causal_mask'):
-                block.attn.causal_mask = block.attn.causal_mask[:,:,:context_length,:context_length]
+        for layer in self.transformer.iter_layers():
+            if hasattr(layer.attn, 'causal_mask'):
+                layer.attn.causal_mask = layer.attn.causal_mask[:,:,:context_length,:context_length]
 
     @classmethod
     def from_pretrained(cls, model_type: str, override_args: Optional[dict] = None) -> GPT:

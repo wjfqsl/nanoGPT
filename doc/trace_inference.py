@@ -58,6 +58,7 @@ import tiktoken
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+from gpt2_weights import normalize_native_state_dict  # noqa: E402
 from model import GPT, GPTConfig  # noqa: E402
 
 
@@ -87,7 +88,7 @@ def load_model(ckpt_path: str, device: str) -> GPT:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     config = GPTConfig.from_model_args(ckpt["model_args"])
     model = GPT(config)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(normalize_native_state_dict(ckpt["model"]))
     model.eval()
     model.to(device)
     return model
@@ -134,30 +135,30 @@ def trace_forward(
     note("概念：离散 token → 连续向量；位置信息加进同一空间（加法，不是拼接）。")
     note(f"之后整网主要在形状 (B, T, C={C}) 的「残差流」上改写表示。")
 
-    # --- blocks ---
-    # 单层 Block（Pre-LN + 两段残差）：
+    # --- layers ---
+    # 单层 Layer（Pre-LN + 两段残差）：
     #
     #   x --ln1--> Attn --+--> x --ln2--> MLP --+--> x
     #      ^______________|        ^______________|
     #
     # 即：x = x + Attn(LN(x));  x = x + MLP(LN(x))
     nh, hs = cfg.n_head, C // cfg.n_head
-    # ModuleList 迭代类型是 Module；用 iter_blocks() 收窄成 Block，才能点进 attn/mlp
-    for layer_i, block in enumerate(model.transformer.iter_blocks()):
+    # ModuleList 迭代类型是 Module；用 iter_layers() 收窄成 Layer，才能点进 attn/mlp
+    for layer_i, layer in enumerate(model.transformer.iter_layers()):
         # 只详细打印第 0 层，其余只打出口形状
         detail = layer_i == 0
         if detail:
-            banner(f"2) Transformer Block[{layer_i}] 详解  "
+            banner(f"2) Transformer Layer[{layer_i}] 详解  "
                    f"(共 {cfg.n_layer} 层；其余层结构相同)")
         elif layer_i == 1:
-            banner(f"3) Block[1..{cfg.n_layer - 1}] 摘要（同构堆叠）")
+            banner(f"3) Layer[1..{cfg.n_layer - 1}] 摘要（同构堆叠）")
 
         x_in = x
 
         # Pre-LN → Attention
-        ln1: torch.Tensor = block.ln1(x)
+        ln1: torch.Tensor = layer.ln1(x)
         # qkv_proj 一次算出 Q|K|V 拼在一起：(B,T,3C) → 再均分三份
-        qkv: torch.Tensor = block.attn.qkv_proj(ln1)
+        qkv: torch.Tensor = layer.attn.qkv_proj(ln1)
         q: torch.Tensor
         k: torch.Tensor
         v: torch.Tensor
@@ -288,7 +289,7 @@ def trace_forward(
         attn_prob: torch.Tensor = F.softmax(attn_weights, dim=-1)
         y: torch.Tensor = attn_prob @ v  # (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # 多头拼回 (B,T,C)
-        attn_out: torch.Tensor = block.attn.resid_dropout(block.attn.out_proj(y))
+        attn_out: torch.Tensor = layer.attn.resid_dropout(layer.attn.out_proj(y))
         x = x_in + attn_out
 
         if detail:
@@ -308,21 +309,21 @@ def trace_forward(
 
         # Pre-LN → MLP（逐位置的通道混合 / 非线性；不在 token 之间通信）
         x_mid = x
-        ln2: torch.Tensor = block.ln2(x)
-        h: torch.Tensor = block.mlp.gelu(block.mlp.up_proj(ln2))       # (B, T, 4C)
-        mlp_out: torch.Tensor = block.mlp.resid_dropout(block.mlp.down_proj(h))
+        ln2: torch.Tensor = layer.ln2(x)
+        h: torch.Tensor = layer.mlp.gelu(layer.mlp.up_proj(ln2))       # (B, T, 4C)
+        mlp_out: torch.Tensor = layer.mlp.resid_dropout(layer.mlp.down_proj(h))
         x = x_mid + mlp_out
 
         if detail:
             show("mlp hidden (4C)", h, f"扩展到 4*{C}={4 * C}，再压回 C")
             show("mlp_out", mlp_out)
             show("x = x + mlp_out", x, "残差：通道混合 / 非线性变换")
-            note("Block 公式：x ← x + Attn(LN(x));  x ← x + MLP(LN(x))")
+            note("Layer 公式：x ← x + Attn(LN(x));  x ← x + MLP(LN(x))")
         else:
             if layer_i < 3 or layer_i == cfg.n_layer - 1:
-                show(f"block[{layer_i}] out", x)
+                show(f"layer[{layer_i}] out", x)
             elif layer_i == 3:
-                print(f"  ... (省略 block[3..{cfg.n_layer - 2}])")
+                print(f"  ... (省略 layer[3..{cfg.n_layer - 2}])")
 
     # --- final norm + head ---
     # lm_head：把最后位置的 C 维向量映到 vocab 维分数（logits）
@@ -418,21 +419,20 @@ def main() -> None:
     trace_forward(model, idx, decode)
 
     # 先拆开看「采样一步」，再用官方 generate 跑完对照（banner 5/6）
-    banner("6) 自回归采样")
-    print(f"  prompt = {args.prompt!r}")
+    print(f"\n  prompt = {args.prompt!r}")
     trace_one_generate_step(
         model, idx, decode,
         temperature=args.temperature, top_k=args.top_k,
     )
+    banner("6) 官方 generate 完整输出")
     with torch.no_grad():
         out = model.generate(
             idx, max_new_tokens=args.max_new_tokens,
             temperature=args.temperature, top_k=args.top_k,
         )
-    print(f"\n  官方 generate 完整输出 ({args.max_new_tokens} new tokens):")
-    print(f"  {decode(out[0].tolist())!r}")
+    print(f"  ({args.max_new_tokens} new tokens): {decode(out[0].tolist())!r}")
     banner("结束")
-    note("对照阅读：model.py 里 GPT.forward / CausalSelfAttention / Block / generate")
+    note("对照阅读：model.py 里 GPT.forward / CausalSelfAttention / Layer / generate")
     note("下一问可以点名某一段输出（例如 attention 矩阵）深入讲。")
 
 

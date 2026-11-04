@@ -30,6 +30,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
+from gpt2_weights import normalize_native_state_dict
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
@@ -193,7 +194,7 @@ elif init_from == 'resume':
     # create the model
     gptconf = gpt_config_from_args(model_args)
     raw_model = GPT(gptconf)
-    raw_model.load_state_dict(loaded_ckpt['model'])
+    raw_model.load_state_dict(normalize_native_state_dict(loaded_ckpt['model']))
     iter_num = loaded_ckpt['iter_num']
     best_val_loss = loaded_ckpt['best_val_loss']
 elif init_from.startswith('gpt2'):
@@ -225,7 +226,7 @@ if init_from == 'resume':
 checkpoint = None # free up memory
 
 # Training engine may be GPT, torch.compile(...), and/or DDP.
-# Keep raw_model: GPT for attribute navigation (transformer/blocks/estimate_mfu/state_dict).
+# Keep raw_model: GPT for attribute navigation (transformer/layers/estimate_mfu/state_dict).
 # torch.compile's static type is roughly "(...) -> Any", which would poison `model` if reassigned.
 model: Any = raw_model
 if compile:

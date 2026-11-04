@@ -25,9 +25,9 @@ sample.py  →  文本生成
 | `LayerNorm` | 可选 bias 的 LayerNorm |
 | `CausalSelfAttention` | 因果自注意力（Flash Attention 可用时走高效路径） |
 | `MLP` | 前馈层（GELU） |
-| `Block` | Transformer block：Attn + MLP + 残差 |
+| `Layer` | Transformer layer：Attn + MLP + 残差 |
 | `GPTConfig` | 超参：`context_length / vocab_size / n_layer / n_head / n_embd / dropout / bias` |
-| `GPT` | 完整模型：token/pos embedding、多层 Block、`lm_head`（与 `tok_emb` weight tying） |
+| `GPT` | 完整模型：token/pos embedding、多层 Layer、`lm_head`（与 `tok_emb` weight tying） |
 
 主要方法：
 
@@ -46,11 +46,11 @@ sample.py  →  文本生成
 | ------ | ------ | ---------- |
 | `HF_GPT2` | GPT-2（`wte`/`c_attn`/`h`） | Conv1D `(in, out)` |
 | `NANOGPT_LEGACY` | 同上 | Linear `(out, in)`（原版 nanoGPT ckpt） |
-| `NATIVE` | 本仓（`tok_emb`/`qkv_proj`/`up_proj`/`down_proj`/`blocks`） | Linear |
+| `NATIVE` | 本仓（`tok_emb`/`qkv_proj`/`up_proj`/`down_proj`/`layers`） | Linear |
 
 - `convert_gpt2_state_dict`：按完整参数表转换；缺键/余键/形状不符即报错
 - `GPT.from_pretrained`：声明 `HF_GPT2` → NATIVE，再 `load_state_dict`
-- train / sample / trace：**只** `load_state_dict` NATIVE；旧 ckpt 先 migrate
+- train / sample / trace：**只** `load_state_dict` NATIVE；旧 ckpt 先 migrate（含 `blocks`→`layers` 键名）
 
 ```bash
 python gpt2_weights.py migrate out-gpt2/ckpt.pt
@@ -202,7 +202,7 @@ python doc/trace_inference.py --prompt "Hello" --max-new-tokens 5
 | 阶段 | 代码 | 关键形状 |
 | ------ | ------ | ---------- |
 | token/pos 嵌入 | `tok_emb` + `pos_emb` | `(B,T)` → `(B,T,C)` |
-| Block × N | `CausalSelfAttention` + `MLP` + 残差 | 保持 `(B,T,C)`；注意力分值 `(B,nh,T,T)` |
+| Layer × N | `CausalSelfAttention` + `MLP` + 残差 | 保持 `(B,T,C)`；注意力分值 `(B,nh,T,T)` |
 | 读出 | `ln_final` + `lm_head` | 最后位置 → `(B,vocab)` logits |
 | 生成 | `generate` | 采样 1 个 id，拼回 `idx`，再 forward |
 

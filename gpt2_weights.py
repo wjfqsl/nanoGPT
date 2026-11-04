@@ -7,7 +7,7 @@ Three parameter-key / layout formats appear in practice:
    weight layout `(in_features, out_features)`.
 2. NANOGPT_LEGACY — same GPT-2 naming, but tensors already stored as `nn.Linear`
    layout `(out_features, in_features)` (original nanoGPT checkpoints).
-3. NATIVE — this repo's module names (`tok_emb`, `blocks`, `qkv_proj`,
+3. NATIVE — this repo's module names (`tok_emb`, `layers`, `qkv_proj`,
    `up_proj`/`down_proj`, …) and Linear layout.
 
 Conversion is an explicit format boundary (see `WeightFormat`), not a string-replace
@@ -24,6 +24,8 @@ import torch
 from torch import Tensor
 
 _COMPILE_PREFIX = "_orig_mod."
+_LEGACY_BLOCKS_PREFIX = "transformer.blocks."
+_LAYERS_PREFIX = "transformer.layers."
 
 
 class WeightFormat(Enum):
@@ -46,6 +48,25 @@ def unwrap_compiled_state_dict(state_dict: Mapping[str, Tensor]) -> Dict[str, Te
             "save the uncompiled module (raw_model.state_dict()) or unwrap uniformly"
         )
     return dict(state_dict)
+
+
+def normalize_native_state_dict(state_dict: Mapping[str, Tensor]) -> Dict[str, Tensor]:
+    """Unwrap compile prefix and rename legacy transformer.blocks.* → layers.*."""
+    sd = unwrap_compiled_state_dict(state_dict)
+    has_blocks = any(k.startswith(_LEGACY_BLOCKS_PREFIX) for k in sd)
+    has_layers = any(k.startswith(_LAYERS_PREFIX) for k in sd)
+    if has_blocks and has_layers:
+        raise ValueError("state_dict mixes transformer.blocks.* and transformer.layers.*")
+    if not has_blocks:
+        return sd
+    out: Dict[str, Tensor] = {}
+    n = len(_LEGACY_BLOCKS_PREFIX)
+    for k, v in sd.items():
+        if k.startswith(_LEGACY_BLOCKS_PREFIX):
+            out[_LAYERS_PREFIX + k[n:]] = v
+        else:
+            out[k] = v
+    return out
 
 
 def iter_gpt2_named_param_specs(n_layer: int, n_embd: int) -> Iterator[Tuple[str, str, int, int]]:
@@ -71,7 +92,7 @@ def iter_gpt2_named_param_specs(n_layer: int, n_embd: int) -> Iterator[Tuple[str
 
     for i in range(n_layer):
         g = f"transformer.h.{i}"
-        n = f"transformer.blocks.{i}"
+        n = f"transformer.layers.{i}"
         yield emb(f"{g}.ln_1.weight", f"{n}.ln1.weight")
         yield emb(f"{g}.ln_1.bias", f"{n}.ln1.bias")
         yield (f"{g}.attn.c_attn.weight", f"{n}.attn.qkv_proj.weight", 3 * n_embd, n_embd)
@@ -234,7 +255,7 @@ def migrate_checkpoint(
 
     fmt = weight_format if weight_format is not None else detect_weight_format(model_sd, n_embd=n_embd)
     if fmt is WeightFormat.NATIVE:
-        ckpt["model"] = unwrap_compiled_state_dict(model_sd)
+        ckpt["model"] = normalize_native_state_dict(model_sd)
         return ckpt
 
     ckpt["model"] = convert_gpt2_state_dict(

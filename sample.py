@@ -6,6 +6,7 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
+from gpt2_weights import normalize_native_state_dict
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
@@ -38,7 +39,7 @@ if init_from == 'resume':
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig.from_model_args(checkpoint['model_args'])
     model = GPT(gptconf)
-    model.load_state_dict(checkpoint['model'])
+    model.load_state_dict(normalize_native_state_dict(checkpoint['model']))
 elif init_from.startswith('gpt2'):
     # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
