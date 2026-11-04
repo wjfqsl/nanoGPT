@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import math
 import inspect
-from dataclasses import dataclass
-from typing import Iterator, Optional, Tuple
+from dataclasses import dataclass, fields
+from typing import Any, Iterator, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -23,13 +23,22 @@ from gpt2_weights import WeightFormat, convert_gpt2_state_dict
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
+    context_length: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+    @classmethod
+    def from_model_args(cls, args: Mapping[str, Any]) -> GPTConfig:
+        """Build config from checkpoint/cli dict; accept legacy key block_size."""
+        d = dict(args)
+        if "context_length" not in d and "block_size" in d:
+            d["context_length"] = d["block_size"]
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: d[k] for k in known if k in d})
 
 
 class LayerNorm(nn.Module):
@@ -78,8 +87,8 @@ class CausalSelfAttention(nn.Module):
             # lower-triangular causal mask for the slow path; not a checkpointed parameter
             self.register_buffer(
                 "causal_mask",
-                torch.tril(torch.ones(config.block_size, config.block_size))
-                    .view(1, 1, config.block_size, config.block_size),
+                torch.tril(torch.ones(config.context_length, config.context_length))
+                    .view(1, 1, config.context_length, config.context_length),
                 persistent=False,
             )
 
@@ -171,7 +180,7 @@ class Transformer(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
+        self.pos_emb = nn.Embedding(config.context_length, config.n_embd)
         self.emb_dropout = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_final = LayerNorm(config.n_embd, bias=config.bias)
@@ -193,7 +202,7 @@ class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         assert config.vocab_size is not None
-        assert config.block_size is not None
+        assert config.context_length is not None
         self.config = config
 
         # decoder-only GPT stack (data flow):
@@ -201,7 +210,7 @@ class GPT(nn.Module):
         #         |                +--> (+) --> emb_dropout --> blocks[0..n) --> ln_final --> lm_head --> logits
         #   pos --+--> pos_emb ----+
         # tok_emb: token embedding  (vocab_size -> n_embd)
-        # pos_emb: position embedding (block_size -> n_embd)
+        # pos_emb: position embedding (context_length -> n_embd)
         # blocks:  n_layer transformer Blocks (attn + mlp, residual)
         # ln_final: final LayerNorm before the language-model head
         self.transformer = Transformer(config)
@@ -245,7 +254,7 @@ class GPT(nn.Module):
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         device = idx.device
         B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        assert T <= self.config.context_length, f"Cannot forward sequence of length {T}, context_length is only {self.config.context_length}"
         pos = torch.arange(0, T, dtype=torch.long, device=device) # shape (T)
 
         # forward the GPT model itself
@@ -267,16 +276,16 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def crop_block_size(self, block_size: int) -> None:
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.pos_emb.weight = nn.Parameter(self.transformer.pos_emb.weight[:block_size])
+    def crop_context_length(self, context_length: int) -> None:
+        # model surgery to decrease the context length if necessary
+        # e.g. we may load the GPT2 pretrained model checkpoint (context_length 1024)
+        # but want to use a smaller context for some smaller, simpler model
+        assert context_length <= self.config.context_length
+        self.config.context_length = context_length
+        self.transformer.pos_emb.weight = nn.Parameter(self.transformer.pos_emb.weight[:context_length])
         for block in self.transformer.iter_blocks():
             if hasattr(block.attn, 'causal_mask'):
-                block.attn.causal_mask = block.attn.causal_mask[:,:,:block_size,:block_size]
+                block.attn.causal_mask = block.attn.causal_mask[:,:,:context_length,:context_length]
 
     @classmethod
     def from_pretrained(cls, model_type: str, override_args: Optional[dict] = None) -> GPT:
@@ -294,9 +303,9 @@ class GPT(nn.Module):
             'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
             'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
         }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
+        print("forcing vocab_size=50257, context_length=1024, bias=True")
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        config_args['context_length'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
         # we can override the dropout rate, if desired
         if 'dropout' in override_args:
@@ -348,7 +357,7 @@ class GPT(nn.Module):
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
         cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.context_length
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
@@ -366,8 +375,8 @@ class GPT(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # if the sequence context is growing too long we must crop it at context_length
+            idx_cond = idx if idx.size(1) <= self.config.context_length else idx[:, -self.config.context_length:]
             # call .forward (not self(...)): Module.__call__ is stubbed as -> Any
             logits, _ = self.forward(idx_cond)
             # pluck the logits at the final step and scale by desired temperature

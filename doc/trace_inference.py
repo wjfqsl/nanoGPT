@@ -85,7 +85,7 @@ def show(name: str, t: torch.Tensor, extra: str = "") -> None:
 
 def load_model(ckpt_path: str, device: str) -> GPT:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    config = GPTConfig(**ckpt["model_args"])
+    config = GPTConfig.from_model_args(ckpt["model_args"])
     model = GPT(config)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -105,7 +105,7 @@ def trace_forward(
     """
     cfg = model.config
     B, T = idx.size()
-    assert T <= cfg.block_size
+    assert T <= cfg.context_length
 
     banner(f"0) 模型入口：输入 token ids  B={B}, T={T}")
     ids = idx[0].tolist()
@@ -403,7 +403,7 @@ def main() -> None:
     model = load_model(args.ckpt, args.device)
     cfg = model.config
     print(f"  GPT-2: n_layer={cfg.n_layer} n_head={cfg.n_head} "
-          f"n_embd={cfg.n_embd} block_size={cfg.block_size} vocab={cfg.vocab_size}")
+          f"n_embd={cfg.n_embd} context_length={cfg.context_length} vocab={cfg.vocab_size}")
 
     banner("Tokenizer：prompt → token ids（tiktoken GPT-2 BPE）")
     print(f"  prompt = {args.prompt!r}")

@@ -50,7 +50,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+context_length = 1024
 # model
 n_layer = 12
 n_head = 12
@@ -82,16 +82,8 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 def gpt_config_from_args(args: dict[str, Any]) -> GPTConfig:
-    # model_args is a loose dict (configurator / checkpoint); build a real GPTConfig for typing.
-    return GPTConfig(
-        n_layer=int(args['n_layer']),
-        n_head=int(args['n_head']),
-        n_embd=int(args['n_embd']),
-        block_size=int(args['block_size']),
-        bias=bool(args['bias']),
-        vocab_size=int(args['vocab_size']),
-        dropout=float(args['dropout']),
-    )
+    # model_args is a loose dict (configurator / checkpoint); accept legacy block_size.
+    return GPTConfig.from_model_args(args)
 
 
 def forward_loss(
@@ -127,7 +119,7 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * context_length
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
@@ -150,9 +142,9 @@ def get_batch(split: str) -> Tuple[torch.Tensor, torch.Tensor]:
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    ix = torch.randint(len(data) - context_length, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+context_length]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+context_length]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -174,7 +166,7 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args: dict[str, Any] = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+model_args: dict[str, Any] = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, context_length=context_length,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 checkpoint: Optional[dict[str, Any]] = None
 raw_model: GPT
@@ -193,11 +185,11 @@ elif init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     loaded_ckpt: dict[str, Any] = torch.load(ckpt_path, map_location=device)
     checkpoint = loaded_ckpt
-    checkpoint_model_args = loaded_ckpt['model_args']
+    checkpoint_model_args = GPTConfig.from_model_args(loaded_ckpt['model_args'])
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
+    for k in ['n_layer', 'n_head', 'n_embd', 'context_length', 'bias', 'vocab_size']:
+        model_args[k] = getattr(checkpoint_model_args, k)
     # create the model
     gptconf = gpt_config_from_args(model_args)
     raw_model = GPT(gptconf)
@@ -210,15 +202,15 @@ elif init_from.startswith('gpt2'):
     override_args = dict(dropout=dropout)
     raw_model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'context_length', 'bias', 'vocab_size']:
         model_args[k] = getattr(raw_model.config, k)
 else:
     raise ValueError(f"unknown init_from: {init_from!r}")
 
-# crop down the model block size if desired, using model surgery
-if block_size < raw_model.config.block_size:
-    raw_model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
+# crop down the model context length if desired, using model surgery
+if context_length < raw_model.config.context_length:
+    raw_model.crop_context_length(context_length)
+    model_args['context_length'] = context_length # so that the checkpoint will have the right value
 raw_model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op

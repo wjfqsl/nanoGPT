@@ -32,7 +32,7 @@ CKPT_LEGACY_BAK = os.path.join(ROOT, "out-gpt2", "ckpt.pt.gpt2-format.bak")
 
 def _tiny_config() -> GPTConfig:
     return GPTConfig(
-        block_size=32,
+        context_length=32,
         vocab_size=128,
         n_layer=2,
         n_head=4,
@@ -264,7 +264,7 @@ class TestModelInvariants(unittest.TestCase):
                 "n_layer": cfg.n_layer,
                 "n_head": cfg.n_head,
                 "n_embd": cfg.n_embd,
-                "block_size": cfg.block_size,
+                "context_length": cfg.context_length,
                 "bias": cfg.bias,
                 "vocab_size": cfg.vocab_size,
                 "dropout": cfg.dropout,
@@ -294,7 +294,7 @@ class TestRealGpt2Checkpoint(unittest.TestCase):
         cls.native_ckpt = torch.load(CKPT_NATIVE, map_location="cpu", weights_only=False)
         cls.legacy_ckpt = torch.load(CKPT_LEGACY_BAK, map_location="cpu", weights_only=False)
         cls.model_args = cls.native_ckpt["model_args"]
-        cls.cfg = GPTConfig(**cls.model_args)
+        cls.cfg = GPTConfig.from_model_args(cls.model_args)
 
     def test_disk_formats(self):
         n_embd = self.model_args["n_embd"]

@@ -36,7 +36,7 @@ if init_from == 'resume':
     # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
+    gptconf = GPTConfig.from_model_args(checkpoint['model_args'])
     model = GPT(gptconf)
     model.load_state_dict(checkpoint['model'])
 elif init_from.startswith('gpt2'):

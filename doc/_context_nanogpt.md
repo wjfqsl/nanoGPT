@@ -26,7 +26,7 @@ sample.py  →  文本生成
 | `CausalSelfAttention` | 因果自注意力（Flash Attention 可用时走高效路径） |
 | `MLP` | 前馈层（GELU） |
 | `Block` | Transformer block：Attn + MLP + 残差 |
-| `GPTConfig` | 超参：`block_size / vocab_size / n_layer / n_head / n_embd / dropout / bias` |
+| `GPTConfig` | 超参：`context_length / vocab_size / n_layer / n_head / n_embd / dropout / bias` |
 | `GPT` | 完整模型：token/pos embedding、多层 Block、`lm_head`（与 `tok_emb` weight tying） |
 
 主要方法：
@@ -36,7 +36,7 @@ sample.py  →  文本生成
 - `configure_optimizers(...)`：分组 AdamW（2D 参数 weight decay，bias/LN 不 decay）
 - `generate(...)`：自回归采样（temperature / top_k）
 - `estimate_mfu(...)`：估算相对 A100 bf16 峰值的 MFU
-- `crop_block_size(...)`：缩小上下文长度（微调小 context 时用）
+- `crop_context_length(...)`：缩小上下文长度（微调小 context 时用）
 
 ### `gpt2_weights.py` — 权重格式转换（唯一边界）
 
@@ -65,7 +65,7 @@ python -m unittest test_regression.py -v
 
 覆盖：格式探测、HF/legacy 往返、缺键/余键拒绝、真实 `out-gpt2` native↔legacy bak 逐张量 + logits 一致。
 
-默认配置接近 GPT-2 124M：`n_layer=12, n_head=12, n_embd=768, block_size=1024`。
+默认配置接近 GPT-2 124M：`n_layer=12, n_head=12, n_embd=768, context_length=1024`。
 
 ---
 
@@ -236,6 +236,6 @@ CPU / Mac：
 ```bash
 python train.py config/train_shakespeare_char.py \
   --device=cpu --compile=False \
-  --block_size=64 --batch_size=12 \
+  --context_length=64 --batch_size=12 \
   --n_layer=4 --n_head=4 --n_embd=128 --max_iters=2000
 ```
