@@ -46,7 +46,7 @@ sample.py  →  文本生成
 | ------ | ------ | ---------- |
 | `HF_GPT2` | GPT-2（`wte`/`c_attn`/`h`） | Conv1D `(in, out)` |
 | `NANOGPT_LEGACY` | 同上 | Linear `(out, in)`（原版 nanoGPT ckpt） |
-| `NATIVE` | 本仓（`tok_emb`/`qkv_proj`/`blocks`） | Linear |
+| `NATIVE` | 本仓（`tok_emb`/`qkv_proj`/`up_proj`/`down_proj`/`blocks`） | Linear |
 
 - `convert_gpt2_state_dict`：按完整参数表转换；缺键/余键/形状不符即报错
 - `GPT.from_pretrained`：声明 `HF_GPT2` → NATIVE，再 `load_state_dict`

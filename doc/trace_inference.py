@@ -169,9 +169,9 @@ def trace_forward(
 
         # 注意力：每个 query 位置用「和各 key 的相似度」对 value 做加权平均
         #
-        #   att = (Q @ K^T) / sqrt(hs)     形状 (B, nh, T, T)
+        #   attn_weights = (Q @ K^T) / sqrt(hs)     形状 (B, nh, T, T)
         #   因果 mask：只能看过去（下三角），未来位置填 -inf
-        #   probs = softmax(att) ;  y = probs @ V
+        #   probs = softmax(attn_weights) ;  y = probs @ V
         #
         # batched 矩阵乘 (@)：前面维是批，最后两维才是矩阵。
         # 对每个 (b, head) 各做一次普通 matmul，共 B*nh 次，合成一个张量：
@@ -230,24 +230,24 @@ def trace_forward(
         #   t=3    *    *    *    *
         #
         # 这是「根据已有上文预测下一个词」，而不是让位置偷看未来再改写自己。
-        att: torch.Tensor = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hs))  # (B, nh, T, T)
+        attn_weights: torch.Tensor = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hs))  # (B, nh, T, T)
         # causal mask
         mask = torch.tril(torch.ones(T, T, device=idx.device, dtype=torch.bool))
-        att = att.masked_fill(~mask, float("-inf"))
+        attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
         # --- softmax → 加权 V → 拼头 → 投影 → 残差 ---
         #
-        # 1) softmax(att, dim=-1)：对每个 query 行，把分数变成概率（行和=1）
+        # 1) softmax(attn_weights, dim=-1)：对每个 query 行，把分数变成概率（行和=1）
         #    -inf 位置 → 概率 0。固定一个 (b,h)，一行示意：
         #
         #         j=0   j=1   j=2   j=3
         #   t=2  [0.1 , 0.3 , 0.6 , 0.0 ]   <- 已 mask 的未来为 0
         #         ^-----------^ 只看 0..t
         #
-        # 2) y = att_prob @ v：用概率对 value 做加权平均
+        # 2) y = attn_prob @ v：用概率对 value 做加权平均
         #
-        #   att_prob: (B, nh, T, T)
-        #   v:        (B, nh, T, hs)
-        #   y:        (B, nh, T, hs)
+        #   attn_prob: (B, nh, T, T)
+        #   v:         (B, nh, T, hs)
+        #   y:         (B, nh, T, hs)
         #
         #   固定 (b,h)、固定 query 位置 t：
         #
@@ -285,8 +285,8 @@ def trace_forward(
         # 4) out_proj：线性层再混一次通道（学「怎么合并各头」）+ resid dropout
         # 5) 残差：x = x_in + attn_out（保留进注意力前的信息 + 注意力更新）
         #
-        att_prob: torch.Tensor = F.softmax(att, dim=-1)
-        y: torch.Tensor = att_prob @ v  # (B, nh, T, hs)
+        attn_prob: torch.Tensor = F.softmax(attn_weights, dim=-1)
+        y: torch.Tensor = attn_prob @ v  # (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # 多头拼回 (B,T,C)
         attn_out: torch.Tensor = block.attn.resid_dropout(block.attn.out_proj(y))
         x = x_in + attn_out
@@ -294,10 +294,10 @@ def trace_forward(
         if detail:
             show("ln1(x)", ln1, "Pre-LN：先归一化再进注意力")
             show("q / k / v", q, f"nh={nh}, head_dim={hs}")
-            show("att scores (masked)", att, "(B, nh, T, T) 上三角为 -inf")
+            show("attn scores (masked)", attn_weights, "(B, nh, T, T) 上三角为 -inf")
             # 打印 head0 的注意力行，看因果结构
             print("  head0 attention probs (rows=query pos, cols=key pos):")
-            probs = att_prob[0, 0].cpu()
+            probs = attn_prob[0, 0].cpu()
             for t in range(T):
                 row = " ".join(f"{probs[t, j]:.2f}" for j in range(T))
                 print(f"    t={t}: [{row}]")
@@ -309,8 +309,8 @@ def trace_forward(
         # Pre-LN → MLP（逐位置的通道混合 / 非线性；不在 token 之间通信）
         x_mid = x
         ln2: torch.Tensor = block.ln2(x)
-        h: torch.Tensor = block.mlp.gelu(block.mlp.fc_in(ln2))       # (B, T, 4C)
-        mlp_out: torch.Tensor = block.mlp.dropout(block.mlp.fc_out(h))
+        h: torch.Tensor = block.mlp.gelu(block.mlp.up_proj(ln2))       # (B, T, 4C)
+        mlp_out: torch.Tensor = block.mlp.resid_dropout(block.mlp.down_proj(h))
         x = x_mid + mlp_out
 
         if detail:

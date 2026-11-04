@@ -7,8 +7,8 @@ Three parameter-key / layout formats appear in practice:
    weight layout `(in_features, out_features)`.
 2. NANOGPT_LEGACY — same GPT-2 naming, but tensors already stored as `nn.Linear`
    layout `(out_features, in_features)` (original nanoGPT checkpoints).
-3. NATIVE — this repo's module names (`tok_emb`, `blocks`, `qkv_proj`, …) and
-   Linear layout.
+3. NATIVE — this repo's module names (`tok_emb`, `blocks`, `qkv_proj`,
+   `up_proj`/`down_proj`, …) and Linear layout.
 
 Conversion is an explicit format boundary (see `WeightFormat`), not a string-replace
 shim inside the model. Train / sample / resume only load NATIVE state_dicts.
@@ -80,10 +80,10 @@ def iter_gpt2_named_param_specs(n_layer: int, n_embd: int) -> Iterator[Tuple[str
         yield emb(f"{g}.attn.c_proj.bias", f"{n}.attn.out_proj.bias")
         yield emb(f"{g}.ln_2.weight", f"{n}.ln2.weight")
         yield emb(f"{g}.ln_2.bias", f"{n}.ln2.bias")
-        yield (f"{g}.mlp.c_fc.weight", f"{n}.mlp.fc_in.weight", 4 * n_embd, n_embd)
-        yield emb(f"{g}.mlp.c_fc.bias", f"{n}.mlp.fc_in.bias")
-        yield (f"{g}.mlp.c_proj.weight", f"{n}.mlp.fc_out.weight", n_embd, 4 * n_embd)
-        yield emb(f"{g}.mlp.c_proj.bias", f"{n}.mlp.fc_out.bias")
+        yield (f"{g}.mlp.c_fc.weight", f"{n}.mlp.up_proj.weight", 4 * n_embd, n_embd)
+        yield emb(f"{g}.mlp.c_fc.bias", f"{n}.mlp.up_proj.bias")
+        yield (f"{g}.mlp.c_proj.weight", f"{n}.mlp.down_proj.weight", n_embd, 4 * n_embd)
+        yield emb(f"{g}.mlp.c_proj.bias", f"{n}.mlp.down_proj.bias")
 
 
 def _is_skippable_gpt2_buffer(key: str) -> bool:
