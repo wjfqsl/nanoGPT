@@ -1,4 +1,9 @@
 {
 	"pythonVersion": "3.10",
-	"pythonPlatform": "Linux"
+	"pythonPlatform": "Linux",
+	"exclude": [
+		"**/site-packages/**",
+		"**/.venv/**",
+		"**/venv/**"
+	]
 }

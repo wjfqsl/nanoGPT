@@ -374,5 +374,30 @@ class TestRealGpt2Checkpoint(unittest.TestCase):
         self.assertEqual(tuple(logits_a.shape), (1, 1, self.cfg.vocab_size))
 
 
+class TestKVCache(unittest.TestCase):
+    """Prefill+decode with KV cache must match a full no-cache forward."""
+
+    def test_prefill_decode_matches_full_forward(self):
+        torch.manual_seed(0)
+        cfg = _tiny_config()
+        model = GPT(cfg)
+        model.eval()
+        prompt = torch.randint(0, cfg.vocab_size, (2, 7))
+        extra = torch.randint(0, cfg.vocab_size, (2, 3))
+
+        with torch.no_grad():
+            logits_full, _ = model(torch.cat([prompt, extra], dim=1))
+
+            logits_prefill, _, kv = model(prompt, use_cache=True)
+            logits_step = None
+            for t in range(extra.size(1)):
+                logits_step, _, kv = model(extra[:, t : t + 1], kv_cache=kv)
+
+        self.assertTrue(torch.allclose(logits_prefill, model(prompt)[0], atol=1e-5, rtol=1e-5))
+        self.assertIsNotNone(logits_step)
+        self.assertTrue(torch.allclose(logits_step, logits_full, atol=1e-5, rtol=1e-5))
+        self.assertEqual(kv[0][0].size(2), prompt.size(1) + extra.size(1))
+
+
 if __name__ == "__main__":
     unittest.main()

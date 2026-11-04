@@ -12,13 +12,17 @@ from __future__ import annotations
 import math
 import inspect
 from dataclasses import dataclass, fields
-from typing import Any, Iterator, Mapping, Optional, Tuple
+from typing import Any, Iterator, List, Mapping, Optional, Tuple, Union, overload
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 from gpt2_weights import WeightFormat, convert_gpt2_state_dict
+
+# Per-layer (K, V); each is (B, n_head, T_cache, head_dim). Full cache is List over n_layer.
+LayerKVCache = Tuple[torch.Tensor, torch.Tensor]
+KVCache = List[LayerKVCache]
 
 
 @dataclass
@@ -92,7 +96,9 @@ class CausalSelfAttention(nn.Module):
                 persistent=False,
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, kv_cache: Optional[LayerKVCache] = None
+    ) -> Tuple[torch.Tensor, LayerKVCache]:
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -106,24 +112,41 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if kv_cache is not None:
+            pk, pv = kv_cache
+            k = torch.cat([pk, k], dim=2)
+            v = torch.cat([pv, v], dim=2)
+        T_k = k.size(2)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T_k) -> (B, nh, T, hs)
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
+            # is_causal=True only valid when T == T_k (full prefill). Decode (T=1, T_k>1):
+            # every new query may attend to all cached keys (already causal by construction).
             y: torch.Tensor = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=self.dropout_p if self.training else 0, is_causal=True
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout_p if self.training else 0,
+                is_causal=(T == T_k),
             )
         else:
             # manual implementation of attention
             attn_weights: torch.Tensor = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            attn_weights = attn_weights.masked_fill(self.causal_mask[:,:,:T,:T] == 0, float('-inf'))
+            # query absolute positions are [T_k - T, T_k); key positions [0, T_k)
+            past = T_k - T
+            if past == 0:
+                attn_weights = attn_weights.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float('-inf'))
+            else:
+                q_pos = torch.arange(past, past + T, device=x.device)[:, None]
+                k_pos = torch.arange(T_k, device=x.device)[None, :]
+                attn_weights = attn_weights.masked_fill(k_pos > q_pos, float('-inf'))
             attn_weights = F.softmax(attn_weights, dim=-1)
             attn_weights = self.attn_dropout(attn_weights)
-            y = attn_weights @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = attn_weights @ v # (B, nh, T, T_k) x (B, nh, T_k, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.out_proj(y))
-        return y
+        return y, (k, v)
 
 
 class MLP(nn.Module):
@@ -163,10 +186,13 @@ class Layer(nn.Module):
         self.ln2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
+    def forward(
+        self, x: torch.Tensor, kv_cache: Optional[LayerKVCache] = None
+    ) -> Tuple[torch.Tensor, LayerKVCache]:
+        attn_out, new_kv = self.attn(self.ln1(x), kv_cache=kv_cache)
+        x = x + attn_out
         x = x + self.mlp(self.ln2(x))
-        return x
+        return x, new_kv
 
 
 class Transformer(nn.Module):
@@ -252,18 +278,50 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    @overload
+    def forward(
+        self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None, *,
+        kv_cache: None = None, use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
+
+    @overload
+    def forward(
+        self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None, *,
+        kv_cache: Optional[KVCache] = ..., use_cache: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], KVCache]: ...
+
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        *,
+        kv_cache: Optional[KVCache] = None,
+        use_cache: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, Optional[torch.Tensor]],
+        Tuple[torch.Tensor, Optional[torch.Tensor], KVCache],
+    ]:
         device = idx.device
         B, T = idx.size()
-        assert T <= self.config.context_length, f"Cannot forward sequence of length {T}, context_length is only {self.config.context_length}"
-        pos = torch.arange(0, T, dtype=torch.long, device=device) # shape (T)
+        past_len = 0 if kv_cache is None else kv_cache[0][0].size(2)
+        assert past_len + T <= self.config.context_length, (
+            f"Cannot forward sequence of length {past_len + T}, "
+            f"context_length is only {self.config.context_length}"
+        )
+        # With KV cache, idx is only the *new* tokens; positions continue from past_len.
+        pos = torch.arange(past_len, past_len + T, dtype=torch.long, device=device)
 
         # forward the GPT model itself
         tok_emb: torch.Tensor = self.transformer.tok_emb(idx) # token embeddings of shape (B, T, n_embd)
         pos_emb: torch.Tensor = self.transformer.pos_emb(pos) # position embeddings of shape (T, n_embd)
         x: torch.Tensor = self.transformer.emb_dropout(tok_emb + pos_emb)
-        for layer in self.transformer.iter_layers():
-            x = layer(x)
+        want_cache = use_cache or kv_cache is not None
+        new_cache: KVCache = []
+        for i, layer in enumerate(self.transformer.iter_layers()):
+            layer_past = None if kv_cache is None else kv_cache[i]
+            x, layer_kv = layer(x, kv_cache=layer_past)
+            if want_cache:
+                new_cache.append(layer_kv)
         x = self.transformer.ln_final(x)
 
         if targets is not None:
@@ -275,6 +333,8 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
+        if want_cache:
+            return logits, loss, new_cache
         return logits, loss
 
     def crop_context_length(self, context_length: int) -> None:
@@ -373,13 +433,22 @@ class GPT(nn.Module):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Prefill runs once on the prompt (builds KV cache); each decode step feeds only the new token.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        kv_cache: Optional[KVCache] = None
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at context_length
-            idx_cond = idx if idx.size(1) <= self.config.context_length else idx[:, -self.config.context_length:]
+            # if the sequence grows past context_length, crop and rebuild cache on the window
+            if idx.size(1) > self.config.context_length:
+                idx_cond = idx[:, -self.config.context_length:]
+                kv_cache = None
+            elif kv_cache is None:
+                idx_cond = idx
+            else:
+                idx_cond = idx[:, -1:]  # decode: only the newly appended token
+
             # call .forward (not self(...)): Module.__call__ is stubbed as -> Any
-            logits, _ = self.forward(idx_cond)
+            logits, _, kv_cache = self.forward(idx_cond, kv_cache=kv_cache, use_cache=True)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
