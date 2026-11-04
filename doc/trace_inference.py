@@ -173,6 +173,54 @@ def trace_forward(
         #   因果 mask：只能看过去（下三角），未来位置填 -inf
         #   probs = softmax(att) ;  y = probs @ V
         #
+        # batched 矩阵乘 (@)：前面维是批，最后两维才是矩阵。
+        # 对每个 (b, head) 各做一次普通 matmul，共 B*nh 次，合成一个张量：
+        #
+        #   q:              (B, nh, T, hs)
+        #   k^T:            (B, nh, hs, T)   <- k.transpose(-2, -1)
+        #   q @ k^T:        (B, nh, T,  T)
+        #
+        # --- 其它维：对齐 / 广播（@ 只吃最后两维；前面维跟 +/* 一样走广播）---
+        #
+        #   规则：除最后两维外，对应位置要么相等，要么有一边是 1（可扩）。
+        #   本行两边前面都是 (B, nh)，完全对齐，无需广播：
+        #
+        #            批维对齐（相等）     矩阵乘（最后两维）
+        #            ---------------     ------------------
+        #   q:       ( B , nh ,          T  , hs )
+        #   k^T:     ( B , nh ,          hs , T  )
+        #             |    |              |    |
+        #             v    v              v    v
+        #   out:     ( B , nh ,          T  , T  )
+        #             ^----^ 逐槽位配对      ^--^ Q@K^T
+        #
+        #   槽位示意（每个格子是一次独立的 T×hs @ hs×T）：
+        #
+        #            head0      head1     ...  head{nh-1}
+        #   batch0   [matmul]   [matmul]  ...  [matmul]
+        #   batch1   [matmul]   [matmul]  ...  [matmul]
+        #    ...
+        #   batch{B-1} ...
+        #
+        #   若一边批维为 1，则广播复用（本注意力路径不会发生，仅示意）：
+        #
+        #   A: (1, T, hs)     B: (B, hs, T)
+        #       |                  |
+        #       +---- 1 -> B ------+   广播后对每个 b 各做一次 matmul
+        #   out: (B, T, T)
+        #
+        #   固定一个 (b,h)，就是：
+        #
+        #        Q_(T x hs)  @  K^T_(hs x T)  =  Att_(T x T)
+        #
+        #        [q0 ·········]   [k0 k1 k2 k3]   [s00 s01 s02 s03]
+        #        [q1 ·········]   [·  ·  ·  · ]   [s10 s11 s12 s13]
+        #        [q2 ·········] @ [·  ·  ·  · ] = [s20 s21 s22 s23]
+        #        [q3 ·········]   [·  ·  ·  · ]   [s30 s31 s32 s33]
+        #                           ^ hs 行
+        #
+        #   每个 sij = qi · kj（点积相似度）；batch/head 维不参与求和，只是并行。
+        #
         # 因果 mask 示意（行=query 位置 t，列=key 位置 j；* 可见，. 屏蔽）：
         #
         #         j=0  j=1  j=2  j=3
@@ -186,6 +234,57 @@ def trace_forward(
         # causal mask
         mask = torch.tril(torch.ones(T, T, device=idx.device, dtype=torch.bool))
         att = att.masked_fill(~mask, float("-inf"))
+        # --- softmax → 加权 V → 拼头 → 投影 → 残差 ---
+        #
+        # 1) softmax(att, dim=-1)：对每个 query 行，把分数变成概率（行和=1）
+        #    -inf 位置 → 概率 0。固定一个 (b,h)，一行示意：
+        #
+        #         j=0   j=1   j=2   j=3
+        #   t=2  [0.1 , 0.3 , 0.6 , 0.0 ]   <- 已 mask 的未来为 0
+        #         ^-----------^ 只看 0..t
+        #
+        # 2) y = att_prob @ v：用概率对 value 做加权平均
+        #
+        #   att_prob: (B, nh, T, T)
+        #   v:        (B, nh, T, hs)
+        #   y:        (B, nh, T, hs)
+        #
+        #   固定 (b,h)、固定 query 位置 t：
+        #
+        #     y[t] = p[t,0]*v[0] + p[t,1]*v[1] + ... + p[t,T-1]*v[T-1]
+        #            (每个 v[j] 是 hs 维向量)
+        #
+        #        probs_(T x T)  @  V_(T x hs)  =  Y_(T x hs)
+        #
+        #        [p00 p01 p02 p03]   [v0····]   [y0····]
+        #        [p10 p11 p12 p13] @ [v1····] = [y1····]
+        #        [p20 p21 p22 p23]   [v2····]   [y2····]
+        #        [p30 p31 p32 p33]   [v3····]   [y3····]
+        #
+        # 3) 多头拼回 (B,T,C)：各头仍分开，要把 nh 个头沿通道维拼接
+        #
+        #   y: (B, nh, T, hs)
+        #        |
+        #        |  transpose(1, 2)  →  (B, T, nh, hs)
+        #        |  contiguous()     →  按新顺序重排 storage（transpose 只改 stride）
+        #        |  view(B, T, C)    →  (B, T, nh*hs)  即 (B, T, C)
+        #        v
+        #
+        #   固定一个 token t（略 batch），拼头示意 nh=2, hs=2 → C=4：
+        #
+        #     拼前 (nh, hs):     head0=[a b]  head1=[c d]
+        #     拼后 (C,):         [a b c d]
+        #
+        #   为何要 contiguous？view 要求内存按新 shape 连续排布。
+        #   transpose 后逻辑顺序变了，storage 还没搬家，直接 view 会失败：
+        #
+        #     storage 仍按 (nh,T,hs) 排:  h0t0 | h0t1 | h0t2 | h1t0 | h1t1 | h1t2
+        #     想 view 成 t0 的一行:       h0t0 , h1t0  ← 中间隔着 h0t1,h0t2，不连续
+        #     contiguous() 拷成:          h0t0 | h1t0 | h0t1 | h1t1 | ... 再 view
+        #
+        # 4) out_proj：线性层再混一次通道（学「怎么合并各头」）+ resid dropout
+        # 5) 残差：x = x_in + attn_out（保留进注意力前的信息 + 注意力更新）
+        #
         att_prob: torch.Tensor = F.softmax(att, dim=-1)
         y: torch.Tensor = att_prob @ v  # (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # 多头拼回 (B,T,C)
