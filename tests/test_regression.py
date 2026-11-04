@@ -2,20 +2,25 @@
 Regression tests for the rename + GPT-2 weight-format boundary.
 
 Run from repo root:
-  python -m unittest test_regression.py -v
+  python -m unittest tests.test_regression -v
 """
 
 from __future__ import annotations
 
 import copy
 import os
+import sys
 import unittest
 from typing import Dict
 
 import torch
 from torch import Tensor
 
-from gpt2_weights import (
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from gpt2_weights import (  # noqa: E402
     WeightFormat,
     convert_gpt2_state_dict,
     detect_weight_format,
@@ -24,9 +29,8 @@ from gpt2_weights import (
     normalize_native_state_dict,
     unwrap_compiled_state_dict,
 )
-from model import GPT, GPTConfig
+from model import GPT, GPTConfig  # noqa: E402
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
 CKPT_NATIVE = os.path.join(ROOT, "out-gpt2", "ckpt.pt")
 CKPT_LEGACY_BAK = os.path.join(ROOT, "out-gpt2", "ckpt.pt.gpt2-format.bak")
 

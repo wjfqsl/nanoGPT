@@ -2,6 +2,20 @@
 
 Karpathy 的 [nanoGPT](https://github.com/karpathy/nanoGPT)：用尽量少的代码训练 / 微调中等规模 GPT。核心是两份约 300 行的文件——`model.py`（模型）和 `train.py`（训练循环）。仓库已偏旧，作者更推荐 [nanochat](https://github.com/karpathy/nanochat)，本仓库仍适合学习 GPT 训练流水线。
 
+## 根目录地图
+
+入口脚本留根；分析 / 测试 / 产物下沉。
+
+| 路径 | 角色 |
+| ------ | ------ |
+| `model.py` / `train.py` / `sample.py` / `configurator.py` | 原版入口 |
+| `gpt2_weights.py` / `bench.py` | 权重边界、吞吐基准（仍根目录） |
+| `config/` / `data/` / `assets/` | 预设、语料、配图 |
+| `tests/` | 回归测试 |
+| `notebooks/` | 参数量 / 缩放律分析 |
+| `doc/` | `_context`、推理跟踪脚本 |
+| `out-*/` | 训练产物（gitignore） |
+
 ## 典型流水线
 
 ```text
@@ -60,7 +74,7 @@ python gpt2_weights.py migrate out-gpt2/ckpt.pt -o out-gpt2/ckpt.native.pt
 ### 回归测试
 
 ```bash
-python -m unittest test_regression.py -v
+python -m unittest tests.test_regression -v
 ```
 
 覆盖：格式探测、HF/legacy 往返、缺键/余键拒绝、真实 `out-gpt2` native↔legacy bak 逐张量 + logits 一致。
@@ -181,8 +195,9 @@ python sample.py --init_from=gpt2-xl --start="Hello"
 
 | 路径 | 说明 |
 | ------ | ------ |
-| `transformer_sizing.ipynb` | Transformer 参数量 / FLOPs 估算 |
-| `scaling_laws.ipynb` | 缩放律相关分析 |
+| `notebooks/transformer_sizing.ipynb` | Transformer 参数量 / FLOPs 估算 |
+| `notebooks/scaling_laws.ipynb` | 缩放律相关分析 |
+| `tests/test_regression.py` | 权重格式 / native ckpt 回归 |
 | `assets/` | README 配图 |
 | `out-gpt2/` 等 | 训练输出目录（checkpoint）；`out-gpt2/ckpt.pt` 为本地转换的 GPT-2 124M |
 | `doc/trace_inference.py` | **一次推理跟踪**：按层打印张量形状 + 概念要点，对照 `model.py` 学习 |
@@ -205,6 +220,8 @@ python doc/trace_inference.py --prompt "Hello" --max-new-tokens 5
 | Layer × N | `CausalSelfAttention` + `MLP` + 残差 | 保持 `(B,T,C)`；注意力分值 `(B,nh,T,T)` |
 | 读出 | `ln_final` + `lm_head` | 最后位置 → `(B,vocab)` logits |
 | 生成 | `generate` | 采样 1 个 id，拼回 `idx`，再 forward |
+
+**Serving（SGLang / prefill·decode / cache hit）** 不在本仓：见 mach_kb [`software/cloud_infer/sglang_learn/_context_sglang_learn.md`](../../../mach_kb/software/cloud_infer/sglang_learn/_context_sglang_learn.md)（LPAI 上上游小模型；与本仓 nanoGPT 并行）。
 
 ---
 
