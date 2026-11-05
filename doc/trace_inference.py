@@ -7,9 +7,9 @@
 边界（先分清，再读图）：
   字符串 → tokenizer → ids → 模型 → logits → 采样 → ids → decode → 字符串
   tokenizer / decode 不属于 GPT 权重；模型入口是 token ids（banner 0），
-  出口是 logits；采样与拼回序列在 generate 循环里（banner 5/6）。
+  出口是 logits。KV cache 在每层 Attention 里写出（见 banner 2）。
 
-全链路（一次「预测下一个 token」的 forward）：
+全链路：
 
   prompt ──tokenizer──> token ids       # Tokenizer banner（网外）
                         |
@@ -19,25 +19,22 @@
                         v
            [tok_emb]+[pos_emb] ──> x    # banner 1  残差流 (B,T,C)
                          |
-           +-------------+-------------+  # banner 2/3  × n_layer
-           |  LN -> Attn -> +x         |
+           +-------------+-------------+  # banner 2/3  × n_layer  ← Prefill
+           |  LN -> Attn -> +x         |     Attn 算出 K/V 并写入 kv_cache[i]
            |  LN -> MLP  -> +x         |
            +-------------+-------------+
                          |
                          v
-           ln_final -> lm_head -> logits # banner 4 模型出口
+           ln_final -> lm_head -> logits # banner 4
                          |
                          v
-                采样 next id -> 拼回序列   # banner 5/6（网外循环）
-                再 forward ...（自回归）
+                采样 next id             # banner 5（网外；用已有 logits）
+                         |
+                         v
+           Decode: 新 token + 复用 cache # banner 5b（Layer0 再看一遍 Attn）
+           generate 循环 …               # banner 6
 
-  KV cache（banner 5b / 官方 generate）：
-    prefill：整段 prompt 一次 forward，写出每层 (K,V)
-    decode ：只喂新 token；Attention 里 cat 历史 K/V，不再重算上文
-
-  重要：本文件的 trace_forward 是手写镜像，不调用 CausalSelfAttention.forward，
-  因此「改 model.py 支持 cache」不会自动让 banner 0..4 走 cache；
-  只有走 GPT.forward(..., use_cache=True) / generate 的路径才有 cache。
+  trace_forward 手写镜像 Attention，与 CausalSelfAttention 同路径；顺带收集每层 (K,V)。
 
 形状约定（读代码时反复出现）：
   B = batch（本脚本通常为 1）
@@ -48,7 +45,8 @@
 
 用法（在仓库根目录）:
   python doc/trace_inference.py
-  python doc/trace_inference.py --prompt "Hello" --max-new-tokens 5
+  python doc/trace_inference.py --prompt "Hello, I am" --max-new-tokens 5
+  python doc/trace_inference.py --no-kv-cache   # Decode 重喂整段，对照有 cache
 """
 
 from __future__ import annotations
@@ -108,10 +106,12 @@ def trace_forward(
     model: GPT,
     idx: torch.Tensor,
     decode: Callable[[Sequence[int]], str],
-) -> torch.Tensor:
-    """镜像 GPT.forward，但逐步打印中间量。返回最后位置的 logits [B, vocab]。
+    use_kv_cache: bool = True,
+) -> Tuple[torch.Tensor, Optional[KVCache]]:
+    """镜像 Prefill：逐步打印中间量。
 
-    与 model(idx) 数学路径一致；本函数多了中间张量打印，方便对照学习。
+    use_kv_cache=True 时收集每层 (K,V)；False 时仍算 Attn，但不保存 cache。
+    返回 (最后位置 logits [B, vocab], kv_cache | None)。
     """
     cfg = model.config
     B, T = idx.size()
@@ -151,7 +151,9 @@ def trace_forward(
     #      ^______________|        ^______________|
     #
     # 即：x = x + Attn(LN(x));  x = x + MLP(LN(x))
+    # Prefill 时每层 Attn 算出 (K,V)；use_kv_cache 时写入 kv_cache[layer] 供 Decode 复用。
     nh, hs = cfg.n_head, C // cfg.n_head
+    kv_cache: Optional[KVCache] = [] if use_kv_cache else None
     # ModuleList 迭代类型是 Module；用 iter_layers() 收窄成 Layer，才能点进 attn/mlp
     for layer_i, layer in enumerate(model.transformer.iter_layers()):
         # 只详细打印第 0 层，其余只打出口形状
@@ -176,6 +178,9 @@ def trace_forward(
         q = q.view(B, T, nh, hs).transpose(1, 2)  # (B, nh, T, hs)
         k = k.view(B, T, nh, hs).transpose(1, 2)
         v = v.view(B, T, nh, hs).transpose(1, 2)
+        if kv_cache is not None:
+            # 与 CausalSelfAttention 在 use_cache 时保存的条目相同
+            kv_cache.append((k, v))
 
         # 注意力：每个 query 位置用「和各 key 的相似度」对 value 做加权平均
         #
@@ -304,6 +309,14 @@ def trace_forward(
         if detail:
             show("ln1(x)", ln1, "Pre-LN：先归一化再进注意力")
             show("q / k / v", q, f"nh={nh}, head_dim={hs}")
+            if use_kv_cache:
+                show("kv_cache[0].K ← k", k, f"T_cache={k.size(2)}；本层 Attn 写出，供 Decode 复用")
+                show("kv_cache[0].V ← v", v)
+                note(f"每一层各自存一份 (K,V)；共 {cfg.n_layer} 层 → kv_cache 长度 {cfg.n_layer}。")
+                note("Prefill：K/V 覆盖整段 prompt；Decode：只算新 token 的 K/V，再 cat 到 cache。")
+            else:
+                show("k / v（本步算出，未写入 cache）", k, "--no-kv-cache：Decode 将重算整段")
+                note("关闭 KV cache：每步自回归都要重新 forward 全部已生成 tokens。")
             show("attn scores (masked)", attn_weights, "(B, nh, T, T) 上三角为 -inf")
             # 打印 head0 的注意力行，看因果结构
             print("  head0 attention probs (rows=query pos, cols=key pos):")
@@ -343,7 +356,10 @@ def trace_forward(
     # 与 GPT.forward 推理路径一致：只算最后一个位置
     logits_last: torch.Tensor = model.lm_head(x[:, [-1], :])  # (B, 1, vocab)
     show("logits (last pos)", logits_last, f"vocab={cfg.vocab_size}")
-    note("GPT.forward 到 logits 为止；采样 / decode 在网外（banner 5/6）。")
+    if use_kv_cache:
+        note("Prefill 结束：logits 出站；KV 已在各层 Attention 写入（见 banner 2）。")
+    else:
+        note("Prefill 结束：logits 出站；未保存 KV（--no-kv-cache）。")
     note("lm_head 与 tok_emb 权重共享（weight tying）：同一矩阵既嵌入又读出。")
     note("logits[i] 越大 → 模型认为下一个 token 是词表第 i 个的「分数」越高。")
 
@@ -353,52 +369,121 @@ def trace_forward(
     print("  top-5 next-token 预测:")
     for p, i in zip(topv.tolist(), topi.tolist()):
         print(f"    p={p:.4f}  id={i:5d}  {decode([i])!r}")
-    return logits
+    return logits, kv_cache
 
 
 @torch.no_grad()
-def trace_one_generate_step(
-    model: GPT,
-    idx: torch.Tensor,
+def sample_next(
+    logits: torch.Tensor,
     decode: Callable[[Sequence[int]], str],
     temperature: float = 1.0,
     top_k: Optional[int] = 40,
-) -> Tuple[torch.Tensor, KVCache]:
-    # Prefill + 一步 decode（对照 SGLang 日志里的 Prefill / Decode batch）：
-    #
-    #   prompt ids ──forward(use_cache)──> logits + kv_cache   # prefill：T=prompt 长
-    #   采样 next id，拼到序列
-    #   next id ──forward(kv_cache)──> logits + 更长的 cache    # decode：T=1
-    #
-    # 这里走官方 GPT.forward（带 cache），不打印层内矩阵；层内详解仍看 banner 0..4。
-    banner("5) Prefill：整段 prompt + 写出 KV cache")
-    logits, _, kv_cache = model.forward(idx, use_cache=True)
-    k0, v0 = kv_cache[0]
-    show("kv_cache[0].K (layer0)", k0, f"T_cache={k0.size(2)}（= prompt 长度）")
-    show("kv_cache[0].V (layer0)", v0)
-    note(f"共 {len(kv_cache)} 层；每层缓存 (K,V)，形状 (B, nh, T_cache, hs)。")
-    note("banner 0..4 的 trace_forward 不会自动走这条路径（它是手写镜像）。")
-
-    logits = logits[:, -1, :] / temperature
+    use_kv_cache: bool = True,
+) -> torch.Tensor:
+    """网外采样：只用已有 logits，不再跑模型。"""
+    banner("5) 采样：logits → next token（网外）")
+    logits = logits / temperature
     if top_k is not None:
         v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
         logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
     probs: torch.Tensor = F.softmax(logits, dim=-1)
     idx_next = torch.multinomial(probs, num_samples=1)
     print(f"  采样得到 id={idx_next.item()}  text={decode(idx_next[0].tolist())!r}")
-    idx = torch.cat((idx, idx_next), dim=1)
+    if use_kv_cache:
+        note("下一步 Decode 只喂这个新 token；上文的 K/V 已在 Prefill 各层写好。")
+    else:
+        note("下一步将重喂「prompt + 新 token」整段（无 cache）。")
+    return idx_next
 
-    banner("5b) Decode 一步：只喂新 token，复用 KV cache")
-    logits2, _, kv_cache = model.forward(idx_next, kv_cache=kv_cache)
-    k0, _ = kv_cache[0]
-    show("输入 idx_next", idx_next, "T=1，不再重喂整段 prompt")
-    show("kv_cache[0].K after", k0, f"T_cache={k0.size(2)}（= prompt+1）")
-    note("Attention 内部：新 K/V cat 到历史 cache；Q 只对当前 token。")
+
+@torch.no_grad()
+def trace_decode_nocache(
+    model: GPT,
+    idx_next: torch.Tensor,
+    decode: Callable[[Sequence[int]], str],
+    idx_so_far: torch.Tensor,
+) -> torch.Tensor:
+    """无 KV cache：把整段序列再 forward 一次（对照有 cache 时只喂 T=1）。"""
+    idx = torch.cat((idx_so_far, idx_next), dim=1)
+    banner("5b) Decode（无 KV cache）：整段序列再 forward")
+    show("输入 idx（全文）", idx, f"T={idx.size(1)}，含 prompt + 新 token")
+    note("每一步自回归都重算全部位置的 K/V；代价随长度增长。")
+    logits, _ = model.forward(idx)
     print(f"  新序列 ids = {idx[0].tolist()}")
     print(f"  新序列 text = {decode(idx[0].tolist())!r}")
-    # logits2 仅用于演示路径；采样已在 prefill 后完成
-    _ = logits2
-    return idx, kv_cache
+    return logits[:, 0, :]
+
+
+@torch.no_grad()
+def trace_decode_step(
+    model: GPT,
+    idx_next: torch.Tensor,
+    kv_cache: KVCache,
+    decode: Callable[[Sequence[int]], str],
+    idx_so_far: torch.Tensor,
+) -> Tuple[torch.Tensor, KVCache]:
+    """Decode 一步：只喂新 token；Layer[0] 详解里展示 K/V cat 进 cache。"""
+    cfg = model.config
+    B, T = idx_next.size()
+    assert T == 1
+    past_len = kv_cache[0][0].size(2)
+    C = cfg.n_embd
+    nh, hs = cfg.n_head, C // cfg.n_head
+
+    banner("5b) Decode：Layer[0] Attention + 复用 KV cache")
+    show("输入 idx_next", idx_next, f"T=1；past_len={past_len}")
+    note("位置从 past_len 起算；不再重算 prompt 的 K/V。")
+
+    pos = torch.arange(past_len, past_len + T, dtype=torch.long, device=idx_next.device)
+    tok_emb: torch.Tensor = model.transformer.tok_emb(idx_next)
+    pos_emb: torch.Tensor = model.transformer.pos_emb(pos)
+    x: torch.Tensor = model.transformer.emb_dropout(tok_emb + pos_emb)
+
+    new_cache: KVCache = []
+    for layer_i, layer in enumerate(model.transformer.iter_layers()):
+        detail = layer_i == 0
+        x_in = x
+        ln1: torch.Tensor = layer.ln1(x)
+        qkv: torch.Tensor = layer.attn.qkv_proj(ln1)
+        q, k_new, v_new = qkv.split(C, dim=2)
+        q = q.view(B, T, nh, hs).transpose(1, 2)
+        k_new = k_new.view(B, T, nh, hs).transpose(1, 2)
+        v_new = v_new.view(B, T, nh, hs).transpose(1, 2)
+
+        pk, pv = kv_cache[layer_i]
+        k = torch.cat([pk, k_new], dim=2)
+        v = torch.cat([pv, v_new], dim=2)
+        new_cache.append((k, v))
+        T_k = k.size(2)
+
+        # Decode：Q 只有新位置；K/V 含历史 → attn (B, nh, 1, T_k)
+        attn_weights: torch.Tensor = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hs))
+        attn_prob: torch.Tensor = F.softmax(attn_weights, dim=-1)
+        y: torch.Tensor = attn_prob @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        attn_out: torch.Tensor = layer.attn.resid_dropout(layer.attn.out_proj(y))
+        x = x_in + attn_out
+
+        if detail:
+            show("k_new / v_new（仅新 token）", k_new, "T=1")
+            show("kv_cache[0].K after cat", k, f"T_cache={T_k}（= past+1）")
+            show("attn scores", attn_weights, f"(B, nh, 1, {T_k})：一行 query × 全部 cached keys")
+            row = " ".join(f"{p:.2f}" for p in attn_prob[0, 0, 0].cpu().tolist())
+            print(f"  head0 attention probs: [{row}]")
+            note("历史 K 前缀应与 Prefill 的 kv_cache[0].K 一致（只在末尾多一列）。")
+
+        x_mid = x
+        ln2: torch.Tensor = layer.ln2(x)
+        h: torch.Tensor = layer.mlp.gelu(layer.mlp.up_proj(ln2))
+        mlp_out: torch.Tensor = layer.mlp.resid_dropout(layer.mlp.down_proj(h))
+        x = x_mid + mlp_out
+
+    x = model.transformer.ln_final(x)
+    logits_last: torch.Tensor = model.lm_head(x[:, [-1], :])
+    idx = torch.cat((idx_so_far, idx_next), dim=1)
+    print(f"  新序列 ids = {idx[0].tolist()}")
+    print(f"  新序列 text = {decode(idx[0].tolist())!r}")
+    return logits_last[:, 0, :], new_cache
 
 
 def main() -> None:
@@ -410,6 +495,12 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=40)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument(
+        "--kv-cache",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Decode/generate 是否使用 KV cache（默认开；--no-kv-cache 关闭）",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -423,6 +514,7 @@ def main() -> None:
     cfg = model.config
     print(f"  GPT-2: n_layer={cfg.n_layer} n_head={cfg.n_head} "
           f"n_embd={cfg.n_embd} context_length={cfg.context_length} vocab={cfg.vocab_size}")
+    print(f"  kv_cache = {args.kv_cache}")
 
     banner("Tokenizer：prompt → token ids（tiktoken GPT-2 BPE）")
     print(f"  prompt = {args.prompt!r}")
@@ -433,25 +525,36 @@ def main() -> None:
     note("tokenizer = 字符串 → 子词 → 词表整数；模型只吃整数，不吃字符串。")
     note("下一行把 ids 包成 (B,T) 张量，本身不是 tokenize。")
 
-    # 详细跟踪一次 forward（对照文件顶部总览图 banner 0..4）
-    trace_forward(model, idx, decode)
-
-    # 先拆开看 prefill + 一步 decode（带 KV cache），再用官方 generate 跑完
+    # Prefill → 采样 → Decode（有/无 cache）→ generate
     print(f"\n  prompt = {args.prompt!r}")
-    trace_one_generate_step(
-        model, idx, decode,
+    logits, kv_cache = trace_forward(model, idx, decode, use_kv_cache=args.kv_cache)
+    idx_next = sample_next(
+        logits, decode,
         temperature=args.temperature, top_k=args.top_k,
+        use_kv_cache=args.kv_cache,
     )
-    banner("6) 官方 generate（内部已用 KV cache：1×prefill + N×decode）")
+    if args.kv_cache:
+        if kv_cache is None:
+            raise RuntimeError("use_kv_cache=True but kv_cache is None")
+        trace_decode_step(model, idx_next, kv_cache, decode, idx)
+        gen_banner = "6) 官方 generate（1×Prefill 写 cache + N×Decode）"
+    else:
+        trace_decode_nocache(model, idx_next, decode, idx)
+        gen_banner = "6) 官方 generate（use_cache=False：每步重喂全文）"
+    banner(gen_banner)
     with torch.no_grad():
         out = model.generate(
             idx, max_new_tokens=args.max_new_tokens,
             temperature=args.temperature, top_k=args.top_k,
+            use_cache=args.kv_cache,
         )
     print(f"  ({args.max_new_tokens} new tokens): {decode(out[0].tolist())!r}")
     banner("结束")
-    note("对照阅读：model.py 里 GPT.forward(use_cache) / CausalSelfAttention / generate")
-    note("banner 0..4 = 层内语义（无 cache）；5/5b/6 = serving 视角的 prefill/decode。")
+    note("对照：model.py CausalSelfAttention / GPT.forward(use_cache) / generate")
+    if args.kv_cache:
+        note("2=Attn 写 KV；5=采样；5b=Decode cat KV；6=完整 generate。")
+    else:
+        note("2=算出 K/V 但不存；5=采样；5b/6=每步重喂全文（--no-kv-cache）。")
 
 
 if __name__ == "__main__":

@@ -429,26 +429,36 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = None) -> torch.Tensor:
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Prefill runs once on the prompt (builds KV cache); each decode step feeds only the new token.
+        With use_cache=True (default): prefill once, then each decode step feeds only the new token.
+        With use_cache=False: every step re-forwards the full cropped sequence (no KV reuse).
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         kv_cache: Optional[KVCache] = None
         for _ in range(max_new_tokens):
-            # if the sequence grows past context_length, crop and rebuild cache on the window
             if idx.size(1) > self.config.context_length:
                 idx_cond = idx[:, -self.config.context_length:]
                 kv_cache = None
-            elif kv_cache is None:
-                idx_cond = idx
-            else:
+            elif use_cache and kv_cache is not None:
                 idx_cond = idx[:, -1:]  # decode: only the newly appended token
+            else:
+                idx_cond = idx
 
             # call .forward (not self(...)): Module.__call__ is stubbed as -> Any
-            logits, _, kv_cache = self.forward(idx_cond, kv_cache=kv_cache, use_cache=True)
+            if use_cache:
+                logits, _, kv_cache = self.forward(idx_cond, kv_cache=kv_cache, use_cache=True)
+            else:
+                logits, _ = self.forward(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
